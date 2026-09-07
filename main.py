@@ -4,11 +4,10 @@ from typing import Dict, Any
 import inngest
 import inngest.fast_api
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 app = FastAPI()
 
-# 1. In-memory storage for reports
 reports_db: Dict[str, Dict[str, Any]] = {}
 
 inngest_client = inngest.Inngest(
@@ -16,24 +15,37 @@ inngest_client = inngest.Inngest(
     is_production=False,
 )
 
-# Schema for incoming request
+# 1. Reject invalid input at the door
 class ReportRequest(BaseModel):
     topic: str
 
-# 2. Inngest Function: make-report
+    @field_validator("topic")
+    @classmethod
+    def validate_topic(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("topic cannot be empty")
+        return v.strip()
+
+# 2. Configure make-report with retries=2
 @inngest_client.create_function(
     fn_id="make-report",
     trigger=inngest.TriggerEvent(event="report/requested"),
+    retries=2,
 )
 async def make_report(ctx: inngest.Context) -> Dict[str, Any]:
     report_id = ctx.event.data["id"]
     topic = ctx.event.data["topic"]
 
-    # Step 1: Simulate the slow work (8 seconds)
+    # Step 1: Slow work simulation
     await ctx.step.sleep("do-the-slow-work", datetime.timedelta(seconds=8))
 
-    # Step 2: Build the report and update in-memory DB
+    # Step 2: Build report or simulate crash
     async def build_report():
+        if topic.lower() == "fail":
+            if report_id in reports_db:
+                reports_db[report_id]["status"] = "failed"
+            raise RuntimeError("The report oven is broken!")
+
         result = f"Summary report on {topic}: Detailed findings and analysis."
         if report_id in reports_db:
             reports_db[report_id]["status"] = "done"
@@ -50,7 +62,6 @@ async def say_hello(ctx: inngest.Context) -> str:
     await ctx.step.sleep("wait-a-bit", datetime.timedelta(seconds=5))
     return "Hello from the background!"
 
-# Serve functions
 inngest.fast_api.serve(
     app,
     inngest_client,
@@ -61,7 +72,6 @@ inngest.fast_api.serve(
 def health_check():
     return {"status": "ok"}
 
-# 3. Fast Door: POST /reports
 @app.post("/reports", status_code=status.HTTP_202_ACCEPTED)
 async def create_report(body: ReportRequest):
     report_id = str(uuid.uuid4())
@@ -72,7 +82,6 @@ async def create_report(body: ReportRequest):
         "result": None,
     }
 
-    # Send event to Inngest to initiate the background task
     await inngest_client.send(
         inngest.Event(
             name="report/requested",
@@ -82,7 +91,6 @@ async def create_report(body: ReportRequest):
 
     return {"id": report_id, "status": "pending"}
 
-# 4. Status Endpoint: GET /reports/{report_id}
 @app.get("/reports/{report_id}")
 def get_report(report_id: str):
     if report_id not in reports_db:
