@@ -15,7 +15,6 @@ inngest_client = inngest.Inngest(
     is_production=False,
 )
 
-# 1. Reject invalid input at the door
 class ReportRequest(BaseModel):
     topic: str
 
@@ -26,7 +25,6 @@ class ReportRequest(BaseModel):
             raise ValueError("topic cannot be empty")
         return v.strip()
 
-# 2. Configure make-report with retries=2
 @inngest_client.create_function(
     fn_id="make-report",
     trigger=inngest.TriggerEvent(event="report/requested"),
@@ -36,10 +34,8 @@ async def make_report(ctx: inngest.Context) -> Dict[str, Any]:
     report_id = ctx.event.data["id"]
     topic = ctx.event.data["topic"]
 
-    # Step 1: Slow work simulation
     await ctx.step.sleep("do-the-slow-work", datetime.timedelta(seconds=8))
 
-    # Step 2: Build report or simulate crash
     async def build_report():
         if topic.lower() == "fail":
             if report_id in reports_db:
@@ -62,10 +58,27 @@ async def say_hello(ctx: inngest.Context) -> str:
     await ctx.step.sleep("wait-a-bit", datetime.timedelta(seconds=5))
     return "Hello from the background!"
 
+# 1. New cron function running every minute
+@inngest_client.create_function(
+    fn_id="heartbeat",
+    trigger=inngest.TriggerCron(cron="* * * * *"),
+)
+async def heartbeat(ctx: inngest.Context) -> Dict[str, int]:
+    def compute_summary():
+        counts = {"pending": 0, "done": 0, "failed": 0}
+        for item in reports_db.values():
+            st = item.get("status", "pending")
+            counts[st] = counts.get(st, 0) + 1
+        print(f"[HEARTBEAT CRON] Status summary -> Pending: {counts['pending']} | Done: {counts['done']} | Failed: {counts['failed']}")
+        return counts
+
+    return await ctx.step.run("log-summary", compute_summary)
+
+# 2. Register all three functions
 inngest.fast_api.serve(
     app,
     inngest_client,
-    [say_hello, make_report],
+    [say_hello, make_report, heartbeat],
 )
 
 @app.get("/health")
